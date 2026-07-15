@@ -7,10 +7,32 @@ This guide explains how to develop custom Speech-to-Text (STT) and Text-to-Speec
 1. [Architecture Overview](#architecture-overview)
 2. [Creating an STT Module](#creating-an-stt-module)
 3. [Creating a TTS Module](#creating-a-tts-module)
+   - [Streaming TTS](#streaming-tts)
 4. [External Provider Requirements](#external-provider-requirements)
 5. [Message Format Specifications](#message-format-specifications)
 6. [Testing Your Module](#testing-your-module)
 7. [Best Practices](#best-practices)
+
+---
+
+> ## The Streaming TTS Contract
+>
+> Custom TTS vendors can run in **non-streaming** mode (VG buffers your full
+> response, then plays it) or **streaming** mode (VG plays audio as chunks
+> arrive, cutting latency to time-to-first-byte).
+>
+> **The request is identical in both modes.** The only difference is the
+> response:
+>
+> | | Non-streaming | Streaming |
+> |---|---|---|
+> | Response body | Any format VG can decode (MP3/WAV/OGG/…) | **Streamed WAV**: 44-byte RIFF header + linear16 PCM @ **8000 Hz mono** |
+> | Delivery | `res.send(buffer)` with `Content-Length` | Pipe/flush the body (chunked transfer encoding), no `Content-Length` |
+> | Enabled by | Always available | **"Enable text-to-speech streaming"** checkbox on the credential |
+>
+> [`lib/tts/deepgram.js`](lib/tts/deepgram.js) is a working reference
+> implementation. See [Streaming TTS](#streaming-tts) below for the full
+> contract and a walkthrough.
 
 ---
 
@@ -26,16 +48,24 @@ This guide explains how to develop custom Speech-to-Text (STT) and Text-to-Speec
 │   │   ├── index.js        # STT router
 │   │   ├── google.js       # Google STT implementation
 │   │   ├── assemblyAi.js   # AssemblyAI STT implementation
-│   │   └── vosk.js         # Vosk STT implementation
+│   │   ├── gladia.js       # Gladia STT implementation
+│   │   ├── vosk.js         # Vosk STT implementation
+│   │   └── smallest.js     # Smallest AI Pulse STT implementation
 │   └── tts/
 │       ├── index.js        # TTS router
-│       └── google.js       # Google TTS implementation
+│       ├── google.js       # Google TTS implementation (non-streaming)
+│       ├── elevenlabs.js   # ElevenLabs TTS implementation (non-streaming)
+│       ├── deepgram.js     # Deepgram TTS implementation (STREAMING — reference impl)
+│       └── smallest.js     # Smallest AI Lightning TTS implementation (STREAMING)
 ```
 
 ### Communication Protocols
 
 - **STT**: WebSocket-based streaming protocol at `/transcribe/<provider-name>`
-- **TTS**: HTTP POST endpoint at `/synthesize/<provider-name>`
+- **TTS**: HTTP POST endpoint at `/synthesize/<provider-name>` — for **both**
+  streaming and non-streaming vendors. Streaming is achieved by streaming the
+  HTTP response body, not by using a different transport (see
+  [Streaming TTS](#streaming-tts)).
 - **Authentication**: Bearer token via `Authorization` header
 
 ### Key Components
@@ -691,58 +721,193 @@ router.post('/', async(req, res) => {
 module.exports = router;
 ```
 
-#### Example 3: Streaming Audio Provider
+---
+
+## Streaming TTS
+
+Everything above returns audio in **non-streaming** mode: your handler buffers
+the full audio and sends it in one shot. Custom TTS vendors can also run in
+**streaming** mode, where Voice Gateway begins playback as soon as the first
+audio chunk arrives — reducing perceived latency from *full synthesis time +
+transfer* down to *time-to-first-byte*.
+
+> This section specifies the streaming contract in full and walks through the
+> reference implementation in [`lib/tts/deepgram.js`](lib/tts/deepgram.js).
+
+### The contract at a glance
+
+Same endpoint, same request — the response is what changes.
+
+#### Request (identical to non-streaming)
+
+```http
+POST /synthesize/<provider-name> HTTP/1.1
+Authorization: Bearer <auth_token>
+Content-Type: application/json
+Accept: audio/wav
+
+{
+  "text": "Hello, how can I help you today?",
+  "voice": "<voice_id>",
+  "language": "en-US",
+  "type": "text",            // or "ssml"
+  "encoding": "linear16",    // always linear16 in v1
+  "sample_rate": 8000        // always 8000 in v1
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `text` | string | Text to synthesize (SSML if `type` is `"ssml"`). |
+| `voice` | string | Voice identifier configured on the credential. |
+| `language` | string | BCP-47 language tag (e.g. `en-US`). |
+| `type` | string | `"text"` or `"ssml"`. |
+| `encoding` | string | Requested encoding — always `"linear16"` in v1. Informational: honor it or ignore it if your endpoint always produces linear16. |
+| `sample_rate` | number | Requested sample rate — always `8000` in v1. |
+
+- `encoding` and `sample_rate` are **new** compared to the non-streaming body;
+  they tell your endpoint exactly what format VG expects so you can avoid
+  resampling guesswork.
+- `voice`, `language`, `type` are the **same** fields sent in non-streaming
+  mode — so a single handler can serve both contracts.
+- If no auth token is configured on the credential, the `Authorization` header
+  is omitted.
+
+#### Response (streaming mode)
+
+```http
+HTTP/1.1 200 OK
+Content-Type: audio/wav
+Transfer-Encoding: chunked
+
+<44-byte RIFF/WAV header><linear16 PCM @ 8000 Hz mono, streamed as chunks>
+```
+
+**Requirements — these are strict in streaming mode:**
+
+1. **`Content-Type: audio/wav`.**
+2. **Format:** a standard 44-byte RIFF/WAV header followed by raw **linear16**
+   (signed 16-bit little-endian) PCM at **8000 Hz, mono**. VG strips the 44-byte
+   header and feeds the raw PCM into FreeSWITCH. The `data` chunk size in the
+   header may be `0` or `0xFFFFFFFF` if the total length is unknown up front.
+3. **Stream the body** — use chunked transfer encoding or progressively flush.
+   Do **not** buffer the whole audio before responding; that defeats streaming.
+   (In Express, simply *not* setting `Content-Length` and piping to `res`
+   produces a chunked response.)
+
+> **Non-streaming is more permissive:** it accepts any format VG can decode
+> (WAV, MP3, OGG, raw PCM). Streaming requires WAV/linear16/8000 Hz
+> specifically.
+
+#### Errors
+
+Signal failures with a non-2xx HTTP status:
+
+| Status | Meaning |
+|--------|---------|
+| 4xx | Client error (bad request, auth failure) |
+| 5xx | Server error |
+| 200 + empty body | Treated as synthesis failure |
+
+The body may carry `{"error": "..."}` for logging, but VG only acts on the
+status code. Note that a **mid-stream** failure (connection dropped after
+headers are sent) results in truncated audio — there is no mid-stream error
+recovery in v1.
+
+### Enabling streaming
+
+Streaming activates only when **all** of these are true:
+
+1. **"Enable text-to-speech streaming"** is checked on the custom speech
+   credential (per-credential, customer-controlled opt-in).
+2. The credential has a TTS URL configured.
+3. The synthesis is a live call (not a cache-render pass).
+
+If any is false, VG uses the non-streaming HTTP POST path. To roll back, uncheck
+the box — the next call uses the non-streaming path, no restart required.
+
+> **Note:** custom TTS streaming is gated *only* by the credential checkbox. The
+> cluster-wide `JAMBONES_DISABLE_TTS_STREAMING` kill-switch for built-in vendors
+> does **not** apply to custom vendors, so streaming works even on clusters
+> where built-in streaming is disabled.
+
+### Reference implementation
+
+[`lib/tts/deepgram.js`](lib/tts/deepgram.js) implements the contract by
+proxying to Deepgram's `/v1/speak` API and piping its WAV response straight
+back. The essential shape:
 
 ```javascript
-const router = require('express').Router();
-const stream = require('stream');
+const routes = require('express').Router();
+const https = require('node:https');
+const {URL} = require('node:url');
 
-router.post('/', async(req, res) => {
+routes.post('/', async(req, res) => {
   const {logger} = req.app.locals;
-  const {language, voice, type, text} = req.body;
+  const {text, voice, language, type, encoding, sample_rate} = req.body;
 
-  try {
-    logger.info({language, voice, type}, 'synthesizing speech');
+  // The request tells us exactly what to produce: linear16 @ 8 kHz.
+  const url = new URL('https://api.deepgram.com/v1/speak');
+  if (voice) url.searchParams.set('model', voice);
+  url.searchParams.set('encoding', encoding || 'linear16');
+  url.searchParams.set('sample_rate', String(sample_rate || 8000));
 
-    // Initialize provider
-    const provider = initializeProvider();
-
-    // Create synthesis stream
-    const synthesisStream = provider.synthesizeStream({
-      text: type === 'ssml' ? text : text,
-      voice: voice,
-      language: language,
-      format: 'mp3'
-    });
-
-    // Set headers
-    res.set('Content-Type', 'audio/mpeg');
-    res.set('Transfer-Encoding', 'chunked');
-
-    // Pipe audio stream to response
-    synthesisStream.pipe(res);
-
-    synthesisStream.on('error', (err) => {
-      logger.error({err}, 'stream error');
-      if (!res.headersSent) {
-        res.status(400).json({error: err.message});
-      }
-    });
-
-    synthesisStream.on('end', () => {
-      logger.info('synthesis stream completed');
-    });
-
-  } catch (err) {
-    logger.error({err}, 'synthesis error');
-    if (!res.headersSent) {
-      res.status(400).json({error: err.message});
+  const body = JSON.stringify({text});
+  const upstream = https.request(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Accept': 'audio/wav',
+      'Content-Length': Buffer.byteLength(body)
     }
-  }
+  }, (dgRes) => {
+    if (dgRes.statusCode < 200 || dgRes.statusCode >= 300) {
+      // Upstream failed and we haven't sent headers yet — return a clean error.
+      return res.status(502).json({error: `upstream returned ${dgRes.statusCode}`});
+    }
+
+    // Stream the WAV straight through. NOT setting Content-Length makes Express
+    // use chunked transfer encoding, so VG can start playback on chunk one.
+    res.set('Content-Type', 'audio/wav');
+    dgRes.pipe(res);
+  });
+
+  upstream.on('error', (err) => {
+    logger.error({err}, 'deepgram request failed');
+    if (!res.headersSent) res.status(502).json({error: 'upstream request failed'});
+    else res.destroy(err);
+  });
+
+  upstream.end(body);
 });
 
-module.exports = router;
+module.exports = routes;
 ```
+
+Key points, and the pitfalls they avoid:
+
+1. **Don't set `Content-Length`.** Piping the body makes the response chunked,
+   which is what lets VG start playback early. A `Content-Length` forces the
+   platform (and often the runtime) to buffer.
+2. **Ask for the format VG requested.** Use `encoding`/`sample_rate` from the
+   body so the upstream engine emits linear16/8000 Hz and no resampling is
+   needed.
+3. **Handle errors before vs. after headers.** Before the first byte you can
+   still send a clean non-2xx status; once streaming has started you can only
+   log and tear down the connection.
+4. **SSML:** Deepgram is plain-text only, so the full module rejects
+   `type: "ssml"` with a 400. An SSML-capable engine would branch on `type`
+   instead.
+
+### Upgrading a non-streaming endpoint
+
+If your endpoint already returns `audio/wav` at linear16/8000 Hz, enabling
+streaming requires **no synthesis changes** — just stream the response body
+(chunked) instead of buffering it, then check the streaming box on the
+credential. If your endpoint returns MP3/OGG or a different PCM format, switch
+it to WAV/linear16/8000 Hz mono (most engines expose format parameters — drive
+them from the `encoding`/`sample_rate` fields VG sends).
 
 ---
 
@@ -898,6 +1063,8 @@ Accept these parameters in the request body (JSON):
 - `type`: Either "text" or "ssml" (SSML support optional)
 - `language`: BCP-47 language code
 - `voice`: Voice identifier/name
+- `encoding`, `sample_rate`: sent in **streaming** mode (always `"linear16"` /
+  `8000` in v1) — see [Streaming TTS](#streaming-tts)
 
 Request format:
 ```json
@@ -921,18 +1088,28 @@ For SSML:
 
 #### 3. Return Audio Response
 
-Return synthesized audio with appropriate headers:
+**Non-streaming mode** — buffer the audio and return it with:
 - `Content-Type`: MIME type of audio (e.g., `audio/mpeg`, `audio/wav`, `audio/ogg`)
 - `Content-Length`: Size of audio data in bytes
 - Body: Raw audio data
 
+**Streaming mode** — stream the body instead:
+- `Content-Type`: `audio/wav` (required)
+- **No `Content-Length`** — send chunked (a 44-byte RIFF header + linear16 PCM
+  @ 8000 Hz mono, flushed progressively)
+- See the full rules in [Streaming TTS](#streaming-tts).
+
 #### 4. Supported Audio Formats
 
-Common formats (choose one or support multiple):
+**Non-streaming** accepts any format VG can decode (choose one or support several):
 - **MP3** (`audio/mpeg`): Compressed, good for streaming
 - **WAV** (`audio/wav`): Uncompressed, higher quality
 - **OGG** (`audio/ogg`): Compressed, open format
 - **PCM** (`audio/l16`): Raw audio
+
+**Streaming** requires **WAV specifically**: a 44-byte RIFF header + linear16
+(signed 16-bit little-endian) PCM at **8000 Hz, mono**. MP3/OGG/headerless PCM
+are not accepted on the streaming path.
 
 #### 5. Error Handling
 
@@ -999,39 +1176,48 @@ app.listen(3000, () => {
 
 #### Example with Streaming Response
 
+To satisfy the VoiceGateway [Streaming TTS](#streaming-tts) contract the streamed
+body must be **WAV / linear16 / 8000 Hz mono**, and you must **not** set a
+`Content-Length` (piping to `res` yields a chunked response):
+
 ```javascript
 app.post('/synthesize', async (req, res) => {
   try {
-    const {text, type, language, voice} = req.body;
+    const {text, type, language, voice, encoding, sample_rate} = req.body;
 
-    // Set headers for streaming
-    res.set('Content-Type', 'audio/mpeg');
-    res.set('Transfer-Encoding', 'chunked');
-
-    // Create synthesis stream
+    // Produce the exact format VG asked for: linear16 @ 8 kHz, in a WAV container.
     const audioStream = createSynthesisStream({
       text,
       isSSML: type === 'ssml',
       language,
-      voice
+      voice,
+      format: 'wav',
+      encoding: encoding || 'linear16',
+      sampleRate: sample_rate || 8000
     });
 
-    // Pipe to response
+    // audio/wav is required; do NOT set Content-Length — let the body stream.
+    res.set('Content-Type', 'audio/wav');
+
+    // Pipe chunk-by-chunk so VG can start playback on the first chunk.
     audioStream.pipe(res);
 
     audioStream.on('error', (err) => {
       console.error('Stream error:', err);
-      if (!res.headersSent) {
-        res.status(500).json({error: err.message});
-      }
+      // Only a clean status is possible before the first byte is sent.
+      if (!res.headersSent) res.status(500).json({error: err.message});
+      else res.destroy(err);
     });
 
   } catch (err) {
     console.error('Synthesis error:', err);
-    res.status(500).json({error: err.message});
+    if (!res.headersSent) res.status(500).json({error: err.message});
   }
 });
 ```
+
+See [`lib/tts/deepgram.js`](lib/tts/deepgram.js) for a complete, runnable
+reference implementation.
 
 ---
 
@@ -1134,6 +1320,8 @@ Fields:
 - `type`: Either "text" or "ssml"
 - `language`: BCP-47 language code
 - `voice`: Voice identifier (provider-specific)
+- `encoding`, `sample_rate`: sent only in **streaming** mode (always
+  `"linear16"` / `8000` in v1) — see [Streaming TTS](#streaming-tts)
 
 ##### SSML Example
 ```json
@@ -1147,12 +1335,20 @@ Fields:
 
 #### 2. Response
 
-##### Success Response
+##### Success Response (non-streaming)
 - Status Code: `200 OK`
 - Headers:
   - `Content-Type`: Audio MIME type (e.g., `audio/mpeg`, `audio/wav`)
-  - `Content-Length`: Size in bytes (for non-streaming responses)
-- Body: Raw audio data
+  - `Content-Length`: Size in bytes
+- Body: Raw audio data (buffered)
+
+##### Success Response (streaming)
+- Status Code: `200 OK`
+- Headers:
+  - `Content-Type`: `audio/wav` (required)
+  - `Transfer-Encoding`: `chunked` (no `Content-Length`)
+- Body: 44-byte RIFF/WAV header + linear16 PCM @ 8000 Hz mono, streamed
+  chunk-by-chunk. See [Streaming TTS](#streaming-tts).
 
 ##### Error Response
 - Status Code: `400` (Bad Request) or `500` (Server Error)
@@ -1450,7 +1646,7 @@ testTTS();
 
 ### Manual Testing with cURL
 
-#### Testing TTS:
+#### Testing TTS (non-streaming):
 ```bash
 curl -X POST http://localhost:3000/synthesize/yourprovider \
   -H "Authorization: Bearer your-api-key" \
@@ -1462,6 +1658,30 @@ curl -X POST http://localhost:3000/synthesize/yourprovider \
     "voice": "en-US-Standard-A"
   }' \
   --output output.mp3
+```
+
+#### Testing TTS (streaming):
+
+Send the streaming body (note `encoding`/`sample_rate`) and save the WAV. The
+`-N`/`--no-buffer` flag lets you observe chunks arriving progressively:
+
+```bash
+curl -N -X POST http://localhost:3000/synthesize/deepgram \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -H "Accept: audio/wav" \
+  -d '{
+    "text": "Hello, world!",
+    "type": "text",
+    "language": "en-US",
+    "voice": "aura-2-thalia-en",
+    "encoding": "linear16",
+    "sample_rate": 8000
+  }' \
+  --output output.wav
+
+# Verify it is linear16, 8000 Hz, mono:
+#   ffprobe output.wav      # or: soxi output.wav
 ```
 
 #### Testing STT:
@@ -1590,8 +1810,12 @@ wscat -c "ws://localhost:3000/transcribe/yourprovider" \
    - WAV: Uncompressed, better quality
    - OGG: Open format, good compression
 
-5. **Streaming**: For large texts, consider streaming the response
+5. **Streaming**: To cut latency, stream the response instead of buffering it.
+   In streaming mode the body must be **WAV/linear16/8000 Hz mono** and must
+   **not** carry a `Content-Length` (pipe it so it goes out chunked). See
+   [Streaming TTS](#streaming-tts).
    ```javascript
+   res.set('Content-Type', 'audio/wav'); // no Content-Length → chunked
    synthStream.pipe(res);
    ```
 
@@ -1719,7 +1943,16 @@ ffmpeg -i input.wav -acodec pcm_s16le -ar 16000 -ac 1 output.raw
    - Check voice name is correct for the language
    - Verify SSML is well-formed if using SSML
 
-4. **Memory Leaks**
+4. **Streaming TTS: no audio / garbled / falls back to non-streaming**
+   - Response must be `audio/wav`, linear16, **exactly 8000 Hz, mono** — a
+     16000/22050 Hz stream sounds fast/garbled or fails
+   - Do **not** set `Content-Length` on the streamed response (it prevents
+     chunked delivery); pipe the body instead
+   - Confirm **"Enable text-to-speech streaming"** is checked on the credential
+     — otherwise VG uses the non-streaming path
+   - See the [Streaming TTS](#streaming-tts) contract for the full checklist
+
+5. **Memory Leaks**
    - Ensure all event listeners are removed
    - Close streams and connections properly
    - Clear buffers when done
@@ -1738,7 +1971,11 @@ LOGLEVEL=info  # debug, info, warn, error
 
 # Provider-specific (examples)
 GCP_JSON_KEY_FILE=/path/to/credentials.json
+ELEVEN_API_KEY=your-elevenlabs-key
+DEEPGRAM_API_KEY=your-deepgram-key   # used by the streaming TTS example
+SMALLEST_API_KEY=your-smallest-key   # used by Smallest AI Lightning TTS + Pulse STT
 ASSEMBLY_AI_API_TOKEN=your-assemblyai-token
+GLADIA_API_KEY=your-gladia-key
 VOSK_URL=localhost:5000
 PROVIDER_API_KEY=your-provider-key
 PROVIDER_ENDPOINT=https://api.provider.com
@@ -1752,6 +1989,7 @@ This guide covered:
 
 ✅ Creating STT modules for various provider types (REST, gRPC, SDK)  
 ✅ Creating TTS modules for various provider types  
+✅ The [streaming TTS contract](#streaming-tts) (chunked WAV/linear16/8 kHz) and a reference implementation  
 ✅ Requirements for external STT/TTS providers  
 ✅ Complete message format specifications  
 ✅ Testing strategies and examples  

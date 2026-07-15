@@ -25,12 +25,12 @@ const transcribeWsServer = new Websocket.Server({ noServer: true });
 transcribeWsServer.setMaxListeners(0);
 transcribeWsServer.on('connection', transcribe.bind(null, logger));
 
-/* set up a websocket server for the TTS Streaming api */
-const ttsStreaming = require('./lib/tts/streaming');
-const ttsWsServer = new Websocket.Server({ noServer: true });
-ttsWsServer.setMaxListeners(0);
-ttsWsServer.on('connection', ttsStreaming.bind(null, logger));
-
+/*
+ * The TTS api is HTTP only. Both non-streaming and streaming custom TTS use the
+ * same POST endpoint (see lib/tts/); streaming is achieved by streaming the
+ * WAV response body rather than buffering it. See the VoiceGateway streaming
+ * custom-TTS contract for details.
+ */
 
 /* set up the http server for the TTS api */
 app.use(express.urlencoded({ extended: true }));
@@ -52,8 +52,8 @@ server.on('upgrade', (request, socket, head) => {
     headers: request.headers,
   }, 'received upgrade request');
 
-  /* verify the path starts with /transcribe */
-  if (!request.url.startsWith('/transcribe') && !request.url.startsWith('/synthesize')) {
+  /* only STT uses websockets; TTS (streaming and non-streaming) is HTTP */
+  if (!request.url.startsWith('/transcribe')) {
     logger.info(`unhandled path: ${request.url}`);
     return socket.write('HTTP/1.1 404 Not Found \r\n\r\n', () => socket.destroy());
   }
@@ -67,10 +67,6 @@ server.on('upgrade', (request, socket, head) => {
   /* complete the upgrade */
   transcribeWsServer.handleUpgrade(request, socket, head, (ws) => {
     logger.info(`upgraded to websocket, url: ${request.url}`);
-    if (request.url.startsWith('/synthesize')) {
-      ttsWsServer.emit('connection', ws, request.url);
-    } else if (request.url.startsWith('/transcribe')) {
-      transcribeWsServer.emit('connection', ws, request.url);
-    }
+    transcribeWsServer.emit('connection', ws, request.url);
   });
 });
