@@ -7,15 +7,20 @@ const port = process.env.PORT || process.env.HTTP_PORT || 3000;
 const routes = require('./lib/tts');
 app.locals = {...app.locals, logger};
 
-const isValidApiKey = (hdr, apiKey) => {
-  const arr = /^Bearer (.*)$/.exec(hdr);
-  return !arr || arr[1] === process.env.API_KEY;
+/*
+ * Cognigy Voice Gateway forwards the admin-configured key as `Authorization: Bearer <key>`
+ * on every TTS HTTP request and STT WebSocket upgrade. We treat that token as the upstream
+ * provider's key (e.g. Smallest.ai) and forward it on, so no provider key is stored here.
+ */
+const extractBearer = (hdr) => {
+  const m = /^Bearer (.*)$/.exec(hdr || '');
+  return m ? m[1] : null;
 };
 
-const verifyApiKey = (req, res, next) => {
-  if (!isValidApiKey(req.headers['authorization'], process.env.API_KEY)) {
-    return res.status(403).json({ message: 'Forbidden' });
-  }
+const requireBearer = (req, res, next) => {
+  const token = extractBearer(req.headers['authorization']);
+  if (!token) return res.status(401).json({ message: 'Missing Bearer token' });
+  req.apiKey = token;
   next();
 };
 
@@ -35,7 +40,7 @@ transcribeWsServer.on('connection', transcribe.bind(null, logger));
 /* set up the http server for the TTS api */
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use('/synthesize', verifyApiKey, routes);
+app.use('/synthesize', requireBearer, routes);
 app.use((err, req, res, next) => {
   logger.error(err, 'burped error');
   res.status(err.status || 500).json({msg: err.message});
@@ -58,15 +63,17 @@ server.on('upgrade', (request, socket, head) => {
     return socket.write('HTTP/1.1 404 Not Found \r\n\r\n', () => socket.destroy());
   }
 
-  /* verify the api key */
-  if (!isValidApiKey(request.headers['authorization'], process.env.API_KEY)) {
-    logger.info(`invalid auth header: ${request.headers['authorization']}`);
-    return socket.write('HTTP/1.1 403 Forbidden \r\n\r\n', () => socket.destroy());
+  /* extract the Bearer token Cognigy forwarded; it is the upstream provider's key */
+  const apiKey = extractBearer(request.headers['authorization']);
+  if (!apiKey) {
+    logger.info(`missing bearer token on upgrade: ${request.headers['authorization']}`);
+    return socket.write('HTTP/1.1 401 Unauthorized \r\n\r\n', () => socket.destroy());
   }
 
-  /* complete the upgrade */
+  /* complete the upgrade; attach the forwarded key so the STT handler can use it */
   transcribeWsServer.handleUpgrade(request, socket, head, (ws) => {
     logger.info(`upgraded to websocket, url: ${request.url}`);
+    ws.apiKey = apiKey;
     transcribeWsServer.emit('connection', ws, request.url);
   });
 });
